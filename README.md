@@ -1,6 +1,6 @@
-markdown# 
+markdown
 
-Chester Buses
+# Chester Buses
 
 A mobile-friendly web app showing the next departures from Chester-area bus stops.
 

@@ -1,0 +1,16 @@
+yaml
+
+name: Refresh BODS data
+
+on:
+  # Manual trigger only for now. We'll enable the scheduled run in Phase 3.
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 4 * * *'  # 04:00 UTC daily
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Placeholder workflow. Real ingestion code lands in Phase 3."

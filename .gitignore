@@ -21,8 +21,6 @@ Thumbs.db
 
 # Local data (GTFS downloads and SQLite database)
 data/*.zip
-data/*.db
-data/*.db-journal
 
 # Logs
 *.log

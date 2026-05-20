@@ -17,6 +17,39 @@ WEEKDAY_COLS = [
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
 ]
 
+# --- Helpers ----------------------------------------------------------------
+
+def format_gtfs_time(s):
+    """Convert HH:MM:SS GTFS time to display format. Handles >24h times."""
+    h, m, _ = s.split(":")
+    h = int(h)
+    if h >= 24:
+        return f"{h - 24:02d}:{m} (next day)"
+    return f"{h:02d}:{m}"
+
+
+def minutes_until(dep_time_str, now):
+    """Format minutes from `now` until a GTFS HH:MM:SS departure time."""
+    h, m, _ = dep_time_str.split(":")
+    h, m = int(h), int(m)
+    days_offset = 0
+    if h >= 24:
+        days_offset = 1
+        h -= 24
+    dep_dt = datetime.datetime.combine(
+        now.date() + datetime.timedelta(days=days_offset),
+        datetime.time(hour=h, minute=m),
+        tzinfo=TZ,
+    )
+    delta_mins = int((dep_dt - now).total_seconds() // 60)
+    if delta_mins < 1:
+        return "due"
+    if delta_mins < 60:
+        return f"{delta_mins} min"
+    hrs, rem = divmod(delta_mins, 60)
+    return f"{hrs}h {rem:02d}m" if rem else f"{hrs}h"
+
+
 
 # --- Data access -------------------------------------------------------------
 
@@ -143,16 +176,23 @@ if selected_name:
         f"As of {now.strftime('%H:%M')} on {now.strftime('%A %d %B %Y')} — "
         f"covering {bay_count} bay{'s' if bay_count != 1 else ''}"
     )
-
-    departures = get_next_departures(stop_ids, now=now, limit=15)
+    
+# Pull a few extra rows so dedup doesn't undershoot the visible list.
+    departures = get_next_departures(stop_ids, now=now, limit=30)
 
     if departures.empty:
         st.info("No more departures today from this stop.")
     else:
         display = pd.DataFrame({
+            "In": departures["departure_time"].apply(lambda s: minutes_until(s, now)),
             "Time": departures["departure_time"].apply(format_gtfs_time),
             "Route": departures["route_short_name"],
             "Destination": departures["destination"],
             "Operator": departures["operator"],
         })
+         # Same trip showing across multiple bays produces duplicate rows.
+        # Treat (time, route, destination) as the identity of a real departure.
+        display = display.drop_duplicates(
+            subset=["Time", "Route", "Destination"], keep="first"
+        ).head(15)
         st.dataframe(display, use_container_width=True, hide_index=True)

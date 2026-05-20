@@ -93,6 +93,14 @@ def get_next_departures(stop_ids, now=None, limit=15):
     finally:
         conn.close()
 
+def format_gtfs_time(s):
+    """Convert HH:MM:SS GTFS time to display format. Handles >24h times."""
+    h, m, _ = s.split(":")
+    h = int(h)
+    if h >= 24:
+        return f"{h - 24:02d}:{m} (next day)"
+    return f"{h:02d}:{m}"
+
 
 # --- UI ----------------------------------------------------------------------
 
@@ -138,7 +146,7 @@ if selected_name:
         st.info("No more departures today from this stop.")
     else:
         display = pd.DataFrame({
-            "Time": departures["departure_time"].str.slice(0, 5),
+            "Time": departures["departure_time"].apply(format_gtfs_time),
             "Route": departures["route_short_name"],
             "Destination": departures["destination"],
             "Operator": departures["operator"],

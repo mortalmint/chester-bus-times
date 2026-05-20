@@ -68,8 +68,11 @@ def get_next_departures(stop_ids, now=None, limit=15):
         )
         SELECT
             st.departure_time,
-            r.route_short_name,
-            COALESCE(t.trip_headsign, r.route_long_name) AS destination,
+            COALESCE(
+                NULLIF(t.terminus, ''),
+                NULLIF(t.trip_headsign, ''),
+                r.route_long_name
+            ) AS destination,
             a.agency_name AS operator
         FROM stop_times st
         JOIN trips  t ON st.trip_id  = t.trip_id

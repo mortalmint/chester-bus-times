@@ -2,9 +2,8 @@ name: Refresh BODS data
 
 on:
   workflow_dispatch:
-  # Schedule is commented out until we've confirmed the workflow works.
-  # schedule:
-  #   - cron: '0 4 * * *'  # 04:00 UTC daily
+  schedule:
+    - cron: '0 4 * * *'  # 04:00 UTC daily
 
 jobs:
   refresh:

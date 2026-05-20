@@ -73,34 +73,62 @@ def filter_to_chester():
     print("Filtering to Chester area...")
     with zipfile.ZipFile(GTFS_ZIP_PATH) as zf:
         # Step 1: stops within the bounding box.
-        stops = read_gtfs(zf, "stops.txt")
+        all_stops = read_gtfs(zf, "stops.txt")
         in_box = (
-            stops["stop_lat"].between(LAT_MIN, LAT_MAX)
-            & stops["stop_lon"].between(LON_MIN, LON_MAX)
+            all_stops["stop_lat"].between(LAT_MIN, LAT_MAX)
+            & all_stops["stop_lon"].between(LON_MIN, LON_MAX)
         )
-        stops = stops.loc[in_box].copy()
-        chester_stop_ids = set(stops["stop_id"])
-        print(f"  Stops in bounding box: {len(stops)}")
+        chester_stops_df = all_stops.loc[in_box].copy()
+        chester_stop_ids = set(chester_stops_df["stop_id"])
+        print(f"  Stops in bounding box: {len(chester_stops_df)}")
 
-        # Step 2: stop_times for those stops. Read in chunks (file is large).
-        stop_times_chunks = []
+        # Step 2: first pass through stop_times — find trips visiting Chester.
+        chester_trip_ids = set()
         for chunk in pd.read_csv(
             zf.open("stop_times.txt"),
             chunksize=200_000,
             dtype={"stop_id": str, "trip_id": str},
         ):
-            stop_times_chunks.append(chunk[chunk["stop_id"].isin(chester_stop_ids)])
-        stop_times = pd.concat(stop_times_chunks, ignore_index=True)
-        chester_trip_ids = set(stop_times["trip_id"])
-        print(f"  Stop-times rows after stop filter: {len(stop_times):,}")
+            visiting = chunk[chunk["stop_id"].isin(chester_stop_ids)]["trip_id"]
+            chester_trip_ids.update(visiting.unique())
+        print(f"  Trips that visit Chester: {len(chester_trip_ids):,}")
 
-        # Step 3: trips referenced by those stop_times.
+        # Step 3: second pass — load ALL stop_times for those trips,
+        # including out-of-area stops (we need the terminus, which may be
+        # outside the bounding box, e.g. Liverpool, Wrexham).
+        full_stop_times_chunks = []
+        for chunk in pd.read_csv(
+            zf.open("stop_times.txt"),
+            chunksize=200_000,
+            dtype={"stop_id": str, "trip_id": str},
+        ):
+            full_stop_times_chunks.append(chunk[chunk["trip_id"].isin(chester_trip_ids)])
+        full_stop_times = pd.concat(full_stop_times_chunks, ignore_index=True)
+        print(f"  Full stop-times for Chester trips: {len(full_stop_times):,}")
+
+        # Step 4: compute terminus (final stop name) per trip.
+        terminus = (
+            full_stop_times.sort_values(["trip_id", "stop_sequence"])
+            .groupby("trip_id")
+            .tail(1)[["trip_id", "stop_id"]]
+            .rename(columns={"stop_id": "terminus_stop_id"})
+        )
+        terminus = terminus.merge(
+            all_stops[["stop_id", "stop_name"]].rename(
+                columns={"stop_id": "terminus_stop_id", "stop_name": "terminus"}
+            ),
+            on="terminus_stop_id",
+            how="left",
+        )[["trip_id", "terminus"]]
+        print(f"  Trip termini computed: {len(terminus):,}")
+
+        # Step 5: load trips, attach terminus, filter to Chester trip_ids.
         trips = read_gtfs(zf, "trips.txt", dtype={"trip_id": str})
         trips = trips[trips["trip_id"].isin(chester_trip_ids)].copy()
-        chester_route_ids = set(trips["route_id"])
-        print(f"  Trips: {len(trips):,}")
+        trips = trips.merge(terminus, on="trip_id", how="left")
 
-        # Step 4: routes — and apply route_type filter (drop trams/ferries/etc).
+        # Step 6: routes — filter to bus-only.
+        chester_route_ids = set(trips["route_id"])
         routes = read_gtfs(zf, "routes.txt")
         routes = routes[
             routes["route_id"].isin(chester_route_ids)
@@ -109,16 +137,23 @@ def filter_to_chester():
         valid_route_ids = set(routes["route_id"])
         print(f"  Routes (bus only): {len(routes)}")
 
-        # Cascade the route filter back through trips and stop_times.
+        # Cascade the route filter back through trips.
         trips = trips[trips["route_id"].isin(valid_route_ids)]
         valid_trip_ids = set(trips["trip_id"])
-        stop_times = stop_times[stop_times["trip_id"].isin(valid_trip_ids)]
-        used_stop_ids = set(stop_times["stop_id"])
-        stops = stops[stops["stop_id"].isin(used_stop_ids)]
-        print(f"  Stops actually used by bus routes: {len(stops)}")
-        print(f"  Final stop-times: {len(stop_times):,}")
 
-        # Step 5: agency / calendar / calendar_dates.
+        # Step 7: filter stop_times for storage — only Chester-area stops,
+        # only trips we kept. The terminus is already on `trips`, so out-of-area
+        # stops don't need to be stored.
+        chester_stop_times = full_stop_times[
+            full_stop_times["trip_id"].isin(valid_trip_ids)
+            & full_stop_times["stop_id"].isin(chester_stop_ids)
+        ]
+        used_stop_ids = set(chester_stop_times["stop_id"])
+        chester_stops_df = chester_stops_df[chester_stops_df["stop_id"].isin(used_stop_ids)]
+        print(f"  Stops actually used by bus routes: {len(chester_stops_df)}")
+        print(f"  Final stop-times: {len(chester_stop_times):,}")
+
+        # Step 8: agency / calendar / calendar_dates — same as before.
         chester_agency_ids = set(routes["agency_id"])
         chester_service_ids = set(trips["service_id"])
 
@@ -143,10 +178,10 @@ def filter_to_chester():
 
     return {
         "agency": agency,
-        "stops": stops,
+        "stops": chester_stops_df,
         "routes": routes,
         "trips": trips,
-        "stop_times": stop_times,
+        "stop_times": chester_stop_times,
         "calendar": calendar,
         "calendar_dates": calendar_dates,
     }

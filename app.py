@@ -3,12 +3,14 @@ app.py — Chester Buses Streamlit app.
 """
 
 import datetime
+import math
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from streamlit_geolocation import streamlit_geolocation
 
 
 DB_PATH = Path("data/chester.db")
@@ -49,6 +51,14 @@ def minutes_until(dep_time_str, now):
     hrs, rem = divmod(delta_mins, 60)
     return f"{hrs}h {rem:02d}m" if rem else f"{hrs}h"
 
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two points, in metres."""
+    r = 6_371_000  # Earth radius in metres
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
 
 # --- Data access -------------------------------------------------------------
@@ -71,6 +81,30 @@ def load_stops_grouped():
         .reset_index(drop=True)
     )
     return grouped
+
+@st.cache_data(ttl=3600)
+def load_stops_with_coords():
+    """One row per unique stop name, with bay stop_ids and an average coordinate."""
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        stops = pd.read_sql_query(
+            "SELECT stop_id, stop_name, stop_lat, stop_lon FROM stops", conn
+        )
+    finally:
+        conn.close()
+    grouped = (
+        stops.groupby("stop_name")
+        .agg(
+            stop_id=("stop_id", list),
+            stop_lat=("stop_lat", "mean"),
+            stop_lon=("stop_lon", "mean"),
+        )
+        .reset_index()
+    )
+    return grouped
+
 
 
 def get_next_departures(stop_ids, now=None, limit=15):
@@ -129,6 +163,33 @@ def get_next_departures(stop_ids, now=None, limit=15):
         return pd.read_sql_query(sql, conn, params=params)
     finally:
         conn.close()
+
+def show_departures(selected_name, stop_ids):
+    """Render the departures table for a chosen stop."""
+    bay_count = len(stop_ids)
+    now = datetime.datetime.now(TZ)
+    st.subheader(selected_name)
+    st.caption(
+        f"As of {now.strftime('%H:%M')} on {now.strftime('%A %d %B %Y')} — "
+        f"covering {bay_count} bay{'s' if bay_count != 1 else ''}"
+    )
+
+    departures = get_next_departures(stop_ids, now=now, limit=30)
+    if departures.empty:
+        st.info("No more departures today from this stop.")
+        return
+
+    display = pd.DataFrame({
+        "In": departures["departure_time"].apply(lambda s: minutes_until(s, now)),
+        "Time": departures["departure_time"].apply(format_gtfs_time),
+        "Route": departures["route_short_name"],
+        "Destination": departures["destination"],
+        "Operator": departures["operator"],
+    })
+    display = display.drop_duplicates(
+        subset=["Time", "Route", "Destination"], keep="first"
+    ).head(15)
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
 def format_gtfs_time(s):
     """Convert HH:MM:SS GTFS time to display format. Handles >24h times."""
@@ -196,3 +257,55 @@ if selected_name:
             subset=["Time", "Route", "Destination"], keep="first"
         ).head(15)
         st.dataframe(display, use_container_width=True, hide_index=True)
+
+# Track the chosen stop across reruns.
+if "chosen_stop" not in st.session_state:
+    st.session_state.chosen_stop = None
+
+# --- Location section --------------------------------------------------------
+st.write("**Find stops near you**")
+st.caption("Tap the location pin, allow access, and we'll list the closest stops.")
+loc = streamlit_geolocation()
+
+if loc and loc.get("latitude") and loc.get("longitude"):
+    coords = load_stops_with_coords()
+    coords = coords.copy()
+    coords["dist_m"] = coords.apply(
+        lambda row: haversine_m(
+            loc["latitude"], loc["longitude"], row["stop_lat"], row["stop_lon"]
+        ),
+        axis=1,
+    )
+    nearest = coords.nsmallest(6, "dist_m")
+    st.caption("Closest stops to you:")
+    for _, row in nearest.iterrows():
+        dist = int(row["dist_m"])
+        label = f"{row['stop_name']} — {dist} m away"
+        if st.button(label, key=f"near_{row['stop_name']}"):
+            st.session_state.chosen_stop = row["stop_name"]
+
+st.divider()
+
+# --- Search section ----------------------------------------------------------
+st.write("**Or search by name**")
+selected_name = st.selectbox(
+    "Search for a stop",
+    options=stops["stop_name"].tolist(),
+    index=None,
+    placeholder="Type to search (e.g. Chester Bus Interchange)...",
+    label_visibility="collapsed",
+)
+if selected_name:
+    st.session_state.chosen_stop = selected_name
+
+# --- Departures --------------------------------------------------------------
+st.divider()
+chosen = st.session_state.chosen_stop
+if chosen:
+    match = stops[stops["stop_name"] == chosen]
+    if not match.empty:
+        show_departures(chosen, match.iloc[0]["stop_id"])
+else:
+    st.info("Pick a stop above to see departures.")
+
+

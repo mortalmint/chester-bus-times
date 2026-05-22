@@ -1,36 +1,38 @@
 """
 app.py — Chester Buses Streamlit app.
 """
- 
+
 import datetime
 import math
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
- 
+
 import pandas as pd
 import streamlit as st
 from streamlit_geolocation import streamlit_geolocation
- 
- 
+
+
 DB_PATH = Path("data/chester.db")
 TZ = ZoneInfo("Europe/London")
 WEEKDAY_COLS = [
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
 ]
- 
- 
+
+
 # --- Helpers ----------------------------------------------------------------
- 
+
 def format_gtfs_time(s):
     """Convert HH:MM:SS GTFS time to display format. Handles >24h times."""
+    if s is None or (isinstance(s, float) and pd.isna(s)) or s == "":
+        return "--"
     h, m, _ = s.split(":")
     h = int(h)
     if h >= 24:
         return f"{h - 24:02d}:{m} (next day)"
     return f"{h:02d}:{m}"
- 
- 
+
+
 def minutes_until(dep_time_str, now):
     """Format minutes from `now` until a GTFS HH:MM:SS departure time."""
     h, m, _ = dep_time_str.split(":")
@@ -51,8 +53,8 @@ def minutes_until(dep_time_str, now):
         return f"{delta_mins} min"
     hrs, rem = divmod(delta_mins, 60)
     return f"{hrs}h {rem:02d}m" if rem else f"{hrs}h"
- 
- 
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     """Great-circle distance between two points, in metres."""
     r = 6_371_000  # Earth radius in metres
@@ -61,10 +63,10 @@ def haversine_m(lat1, lon1, lat2, lon2):
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
- 
- 
+
+
 # --- Data access -------------------------------------------------------------
- 
+
 @st.cache_data(ttl=3600)
 def load_stops_grouped():
     """Stops grouped by name. One row per unique name, with all bay stop_ids."""
@@ -83,8 +85,8 @@ def load_stops_grouped():
         .reset_index(drop=True)
     )
     return grouped
- 
- 
+
+
 @st.cache_data(ttl=3600)
 def load_stops_with_coords():
     """One row per unique stop name, with bay stop_ids and an average coordinate."""
@@ -107,20 +109,24 @@ def load_stops_with_coords():
         .reset_index()
     )
     return grouped
- 
- 
+
+
 def get_next_departures(stop_ids, now=None, limit=15):
-    """Next N departures from any of the given stop_ids, after `now`."""
+    """Next N departures from any of the given stop_ids, after `now`.
+
+    Returns trip_id and boarding_seq alongside the display fields so the
+    caller can look up the onward stops for a chosen departure.
+    """
     if now is None:
         now = datetime.datetime.now(TZ)
- 
+
     today = now.date()
     weekday_col = WEEKDAY_COLS[today.weekday()]
     today_int = int(today.strftime("%Y%m%d"))
     now_time_str = now.strftime("%H:%M:%S")
- 
+
     placeholders = ",".join(["?"] * len(stop_ids))
- 
+
     sql = f"""
         WITH services_today AS (
             SELECT service_id FROM calendar
@@ -136,6 +142,8 @@ def get_next_departures(stop_ids, now=None, limit=15):
             WHERE date = ? AND exception_type = 1
         )
         SELECT
+            st.trip_id,
+            st.stop_sequence AS boarding_seq,
             st.departure_time,
             r.route_short_name,
             COALESCE(
@@ -145,12 +153,25 @@ def get_next_departures(stop_ids, now=None, limit=15):
             ) AS destination,
             a.agency_name AS operator
         FROM stop_times st
-        JOIN trips  t ON st.trip_id  = t.trip_id
-        JOIN routes r ON t.route_id  = r.route_id
-        JOIN agency a ON r.agency_id = a.agency_id
+        JOIN trips  t  ON st.trip_id  = t.trip_id
+        JOIN routes r  ON t.route_id  = r.route_id
+        JOIN agency a  ON r.agency_id = a.agency_id
+        JOIN stops  bs ON st.stop_id  = bs.stop_id
         WHERE st.stop_id IN ({placeholders})
           AND t.service_id IN (SELECT service_id FROM services_today)
           AND st.departure_time >= ?
+          AND (
+              -- The trip continues to a later stop we have stored...
+              EXISTS (
+                  SELECT 1 FROM stop_times sl
+                  WHERE sl.trip_id = st.trip_id
+                    AND sl.stop_sequence > st.stop_sequence
+              )
+              -- ...or it continues out of our coverage area (so this stop
+              -- isn't the real terminus). Excludes circular loop-backs and
+              -- genuine end-of-line arrivals, which aren't boardable.
+              OR COALESCE(t.terminus, '') <> bs.stop_name
+          )
         ORDER BY st.departure_time
         LIMIT ?
     """
@@ -159,16 +180,39 @@ def get_next_departures(stop_ids, now=None, limit=15):
         + list(stop_ids)
         + [now_time_str, limit]
     )
- 
+
     conn = sqlite3.connect(DB_PATH)
     try:
         return pd.read_sql_query(sql, conn, params=params)
     finally:
         conn.close()
- 
- 
+
+
+def get_onward_stops(trip_id, from_sequence):
+    """Stops a given trip visits after `from_sequence`, with arrival times.
+
+    Limited to stops stored in our database (the Chester area). For routes
+    that continue beyond the area, this list is truncated at the boundary.
+    """
+    sql = """
+        SELECT
+            st.stop_sequence,
+            COALESCE(NULLIF(st.arrival_time, ''), st.departure_time) AS arrival_time,
+            s.stop_name
+        FROM stop_times st
+        JOIN stops s ON st.stop_id = s.stop_id
+        WHERE st.trip_id = ? AND st.stop_sequence > ?
+        ORDER BY st.stop_sequence
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql_query(sql, conn, params=[trip_id, int(from_sequence)])
+    finally:
+        conn.close()
+
+
 def show_departures(selected_name, stop_ids):
-    """Render the departures table for a chosen stop."""
+    """Render the departures for a chosen stop, each expandable to onward stops."""
     bay_count = len(stop_ids)
     now = datetime.datetime.now(TZ)
     st.subheader(selected_name)
@@ -176,50 +220,71 @@ def show_departures(selected_name, stop_ids):
         f"As of {now.strftime('%H:%M')} on {now.strftime('%A %d %B %Y')} — "
         f"covering {bay_count} bay{'s' if bay_count != 1 else ''}"
     )
- 
+
     departures = get_next_departures(stop_ids, now=now, limit=30)
     if departures.empty:
         st.info("No more departures today from this stop.")
         return
- 
-    display = pd.DataFrame({
-        "In": departures["departure_time"].apply(lambda s: minutes_until(s, now)),
-        "Time": departures["departure_time"].apply(format_gtfs_time),
-        "Route": departures["route_short_name"],
-        "Destination": departures["destination"],
-        "Operator": departures["operator"],
-    })
-    display = display.drop_duplicates(
-        subset=["Time", "Route", "Destination"], keep="first"
-    ).head(15)
-    st.dataframe(display, use_container_width=True, hide_index=True)
- 
- 
+
+    # Same trip across multiple bays produces duplicate rows; collapse them.
+    departures = departures.drop_duplicates(
+        subset=["departure_time", "route_short_name", "destination"], keep="first"
+    ).head(15).reset_index(drop=True)
+
+    st.caption("Tap a departure to see its onward stops.")
+    for _, dep in departures.iterrows():
+        route = dep["route_short_name"] if dep["route_short_name"] else "?"
+        clock = format_gtfs_time(dep["departure_time"])
+        mins = minutes_until(dep["departure_time"], now)
+        dest = dep["destination"] or ""
+        header = f"{mins}  ·  {clock}  ·  Route {route} → {dest}"
+
+        with st.expander(header):
+            onward = get_onward_stops(dep["trip_id"], dep["boarding_seq"])
+            st.caption(f"Operated by {dep['operator']}")
+            if onward.empty:
+                st.write("This stop is the end of the line for this service.")
+            else:
+                onward_display = pd.DataFrame({
+                    "Arrives": onward["arrival_time"].apply(format_gtfs_time),
+                    "Stop": onward["stop_name"],
+                })
+                st.dataframe(
+                    onward_display, use_container_width=True, hide_index=True
+                )
+                last_shown = onward["stop_name"].iloc[-1]
+                if dest and last_shown != dest:
+                    st.caption(
+                        f"Continues towards {dest} — stops beyond the Chester "
+                        f"area aren't shown."
+                    )
+
+
 # --- UI ----------------------------------------------------------------------
- 
+
 st.set_page_config(
     page_title="Chester Buses",
     page_icon="🚌",
     layout="centered",
 )
- 
+
 st.title("Chester Buses")
 st.caption("Next departures from Chester-area bus stops. Data from BODS (DfT).")
- 
+
 stops = load_stops_grouped()
 if stops.empty:
     st.warning("No data loaded.")
     st.stop()
- 
+
 # Track the chosen stop across reruns.
 if "chosen_stop" not in st.session_state:
     st.session_state.chosen_stop = None
- 
+
 # --- Location section --------------------------------------------------------
 st.write("**Find stops near you**")
 st.caption("Tap the location pin, allow access, and we'll list the closest stops.")
 loc = streamlit_geolocation()
- 
+
 if loc and loc.get("latitude") and loc.get("longitude"):
     coords = load_stops_with_coords().copy()
     coords["dist_m"] = coords.apply(
@@ -235,9 +300,9 @@ if loc and loc.get("latitude") and loc.get("longitude"):
         label = f"{row['stop_name']} — {dist} m away"
         if st.button(label, key=f"near_{row['stop_name']}"):
             st.session_state.chosen_stop = row["stop_name"]
- 
+
 st.divider()
- 
+
 # --- Search section ----------------------------------------------------------
 st.write("**Or search by name**")
 selected_name = st.selectbox(
@@ -249,7 +314,7 @@ selected_name = st.selectbox(
 )
 if selected_name:
     st.session_state.chosen_stop = selected_name
- 
+
 # --- Departures --------------------------------------------------------------
 st.divider()
 chosen = st.session_state.chosen_stop

@@ -227,12 +227,15 @@ def get_stop_points(stop_ids):
 
 
 def build_map_points(stop_points, user_lat=None, user_lon=None):
-    """Combine stop bay points (red) with the user's location (blue) for st.map."""
+    """Combine stop bay points (red) with the user's location (blue) for st.map.
+
+    Colours carry a 50% alpha channel (the trailing `80`).
+    """
     pts = stop_points.copy()
-    pts["color"] = "#d62728"  # red = the stop
+    pts["color"] = "#d6272880"  # red @ 50% = the stop
     if user_lat is not None and user_lon is not None:
         user_row = pd.DataFrame(
-            {"lat": [user_lat], "lon": [user_lon], "color": ["#1f77b4"]}  # blue = you
+            {"lat": [user_lat], "lon": [user_lon], "color": ["#1f77b480"]}  # blue @ 50% = you
         )
         pts = pd.concat([pts, user_row], ignore_index=True)
     return pts
@@ -261,10 +264,10 @@ def show_departures(selected_name, stop_ids):
             has_user = len(map_points) > len(points)
             if has_user:
                 # Two markers — let the map auto-fit so both are visible.
-                st.map(map_points, color="color")
+                st.map(map_points, color="color", size=80)
                 st.caption("Blue dot = you · red dot = the stop")
             else:
-                st.map(map_points, zoom=15, color="color")
+                st.map(map_points, zoom=15, color="color", size=80)
 
     departures = get_next_departures(stop_ids, now=now, limit=30)
     if departures.empty:

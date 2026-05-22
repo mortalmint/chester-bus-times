@@ -1,27 +1,27 @@
 """
 app.py — Chester Buses Streamlit app.
 """
- 
+
 import datetime
 import math
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
- 
+
 import pandas as pd
 import streamlit as st
 from streamlit_geolocation import streamlit_geolocation
- 
- 
+
+
 DB_PATH = Path("data/chester.db")
 TZ = ZoneInfo("Europe/London")
 WEEKDAY_COLS = [
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
 ]
- 
- 
+
+
 # --- Helpers ----------------------------------------------------------------
- 
+
 def format_gtfs_time(s):
     """Convert HH:MM:SS GTFS time to display format. Handles >24h times."""
     if s is None or (isinstance(s, float) and pd.isna(s)) or s == "":
@@ -31,8 +31,8 @@ def format_gtfs_time(s):
     if h >= 24:
         return f"{h - 24:02d}:{m} (next day)"
     return f"{h:02d}:{m}"
- 
- 
+
+
 def minutes_until(dep_time_str, now):
     """Format minutes from `now` until a GTFS HH:MM:SS departure time."""
     h, m, _ = dep_time_str.split(":")
@@ -53,8 +53,8 @@ def minutes_until(dep_time_str, now):
         return f"{delta_mins} min"
     hrs, rem = divmod(delta_mins, 60)
     return f"{hrs}h {rem:02d}m" if rem else f"{hrs}h"
- 
- 
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     """Great-circle distance between two points, in metres."""
     r = 6_371_000  # Earth radius in metres
@@ -63,10 +63,10 @@ def haversine_m(lat1, lon1, lat2, lon2):
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
- 
- 
+
+
 # --- Data access -------------------------------------------------------------
- 
+
 @st.cache_data(ttl=3600)
 def load_stops_grouped():
     """Stops grouped by name. One row per unique name, with all bay stop_ids."""
@@ -85,8 +85,8 @@ def load_stops_grouped():
         .reset_index(drop=True)
     )
     return grouped
- 
- 
+
+
 @st.cache_data(ttl=3600)
 def load_stops_with_coords():
     """One row per unique stop name, with bay stop_ids and an average coordinate."""
@@ -109,24 +109,24 @@ def load_stops_with_coords():
         .reset_index()
     )
     return grouped
- 
- 
+
+
 def get_next_departures(stop_ids, now=None, limit=15):
     """Next N departures from any of the given stop_ids, after `now`.
- 
+
     Returns trip_id and boarding_seq alongside the display fields so the
     caller can look up the onward stops for a chosen departure.
     """
     if now is None:
         now = datetime.datetime.now(TZ)
- 
+
     today = now.date()
     weekday_col = WEEKDAY_COLS[today.weekday()]
     today_int = int(today.strftime("%Y%m%d"))
     now_time_str = now.strftime("%H:%M:%S")
- 
+
     placeholders = ",".join(["?"] * len(stop_ids))
- 
+
     sql = f"""
         WITH services_today AS (
             SELECT service_id FROM calendar
@@ -180,17 +180,17 @@ def get_next_departures(stop_ids, now=None, limit=15):
         + list(stop_ids)
         + [now_time_str, limit]
     )
- 
+
     conn = sqlite3.connect(DB_PATH)
     try:
         return pd.read_sql_query(sql, conn, params=params)
     finally:
         conn.close()
- 
- 
+
+
 def get_onward_stops(trip_id, from_sequence):
     """Stops a given trip visits after `from_sequence`, with arrival times.
- 
+
     Limited to stops stored in our database (the Chester area). For routes
     that continue beyond the area, this list is truncated at the boundary.
     """
@@ -209,8 +209,8 @@ def get_onward_stops(trip_id, from_sequence):
         return pd.read_sql_query(sql, conn, params=[trip_id, int(from_sequence)])
     finally:
         conn.close()
- 
- 
+
+
 def get_stop_points(stop_ids):
     """Lat/lon for each bay of a stop, for mapping."""
     placeholders = ",".join(["?"] * len(stop_ids))
@@ -224,8 +224,20 @@ def get_stop_points(stop_ids):
         return pd.read_sql_query(sql, conn, params=list(stop_ids))
     finally:
         conn.close()
- 
- 
+
+
+def build_map_points(stop_points, user_lat=None, user_lon=None):
+    """Combine stop bay points (red) with the user's location (blue) for st.map."""
+    pts = stop_points.copy()
+    pts["color"] = "#d62728"  # red = the stop
+    if user_lat is not None and user_lon is not None:
+        user_row = pd.DataFrame(
+            {"lat": [user_lat], "lon": [user_lon], "color": ["#1f77b4"]}  # blue = you
+        )
+        pts = pd.concat([pts, user_row], ignore_index=True)
+    return pts
+
+
 def show_departures(selected_name, stop_ids):
     """Render the departures for a chosen stop, each expandable to onward stops."""
     bay_count = len(stop_ids)
@@ -235,24 +247,35 @@ def show_departures(selected_name, stop_ids):
         f"As of {now.strftime('%H:%M')} on {now.strftime('%A %d %B %Y')} — "
         f"covering {bay_count} bay{'s' if bay_count != 1 else ''}"
     )
- 
+
     with st.expander("Show this stop on a map"):
         points = get_stop_points(stop_ids)
         if points.empty:
             st.write("No location data for this stop.")
         else:
-            st.map(points, zoom=15)
- 
+            map_points = build_map_points(
+                points,
+                st.session_state.get("user_lat"),
+                st.session_state.get("user_lon"),
+            )
+            has_user = len(map_points) > len(points)
+            if has_user:
+                # Two markers — let the map auto-fit so both are visible.
+                st.map(map_points, color="color")
+                st.caption("Blue dot = you · red dot = the stop")
+            else:
+                st.map(map_points, zoom=15, color="color")
+
     departures = get_next_departures(stop_ids, now=now, limit=30)
     if departures.empty:
         st.info("No more departures today from this stop.")
         return
- 
+
     # Same trip across multiple bays produces duplicate rows; collapse them.
     departures = departures.drop_duplicates(
         subset=["departure_time", "route_short_name", "destination"], keep="first"
     ).head(15).reset_index(drop=True)
- 
+
     st.caption("Tap a departure to see its onward stops.")
     for _, dep in departures.iterrows():
         route = dep["route_short_name"] if dep["route_short_name"] else "?"
@@ -260,7 +283,7 @@ def show_departures(selected_name, stop_ids):
         mins = minutes_until(dep["departure_time"], now)
         dest = dep["destination"] or ""
         header = f"{mins}  ·  {clock}  ·  Route {route} → {dest}"
- 
+
         with st.expander(header):
             onward = get_onward_stops(dep["trip_id"], dep["boarding_seq"])
             st.caption(f"Operated by {dep['operator']}")
@@ -280,34 +303,36 @@ def show_departures(selected_name, stop_ids):
                         f"Continues towards {dest} — stops beyond the Chester "
                         f"area aren't shown."
                     )
- 
- 
+
+
 # --- UI ----------------------------------------------------------------------
- 
+
 st.set_page_config(
     page_title="Chester Buses",
     page_icon="🚌",
     layout="centered",
 )
- 
+
 st.title("Chester Buses")
 st.caption("Next departures from Chester-area bus stops. Data from BODS (DfT).")
- 
+
 stops = load_stops_grouped()
 if stops.empty:
     st.warning("No data loaded.")
     st.stop()
- 
+
 # Track the chosen stop across reruns.
 if "chosen_stop" not in st.session_state:
     st.session_state.chosen_stop = None
- 
+
 # --- Location section --------------------------------------------------------
 st.write("**Find stops near you**")
 st.caption("Tap the location pin, allow access, and we'll list the closest stops.")
 loc = streamlit_geolocation()
- 
+
 if loc and loc.get("latitude") and loc.get("longitude"):
+    st.session_state.user_lat = loc["latitude"]
+    st.session_state.user_lon = loc["longitude"]
     coords = load_stops_with_coords().copy()
     coords["dist_m"] = coords.apply(
         lambda row: haversine_m(
@@ -322,9 +347,9 @@ if loc and loc.get("latitude") and loc.get("longitude"):
         label = f"{row['stop_name']} — {dist} m away"
         if st.button(label, key=f"near_{row['stop_name']}"):
             st.session_state.chosen_stop = row["stop_name"]
- 
+
 st.divider()
- 
+
 # --- Search section ----------------------------------------------------------
 st.write("**Or search by name**")
 selected_name = st.selectbox(
@@ -336,7 +361,7 @@ selected_name = st.selectbox(
 )
 if selected_name:
     st.session_state.chosen_stop = selected_name
- 
+
 # --- Departures --------------------------------------------------------------
 st.divider()
 chosen = st.session_state.chosen_stop
